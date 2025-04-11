@@ -16,6 +16,9 @@ A lightweight CLI tool for monitoring power usage from smart plugs in real-time,
 - Continuous monitoring with charts and historical data
 - Simple command-line interface
 
+## Latest changes
+- v0.1.4 : Uses latest python-kasa version(0.10.2), various fixes and improvements.
+
 ## Installation
 
 ### Via pip
