@@ -10,14 +10,32 @@ import sys
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 
+from . import config
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
 logger = logging.getLogger(__name__)
+
+# Store a global event loop to prevent "event loop is closed" errors
+_event_loop = None
+
+def get_event_loop():
+    """Get a persistent event loop to avoid 'event loop is closed' errors."""
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+    return _event_loop
 
 class KasaError(Exception):
     """Exception raised for Kasa device errors."""
     pass
 
 try:
-    from kasa import SmartPlug, SmartDevice
+    from kasa import Discover
+    from kasa.device import Device
+    from kasa.iot import IotPlug
     KASA_AVAILABLE = True
 except ImportError:
     KASA_AVAILABLE = False
@@ -27,24 +45,17 @@ class KasaDevice:
     """Client for TP-Link Kasa smart plugs."""
     
     def __init__(self, device_ip: str, alias: str = "", username: Optional[str] = None, password: Optional[str] = None):
-        """Initialize the Kasa device client.
-        
-        Args:
-            device_ip: IP address of the Kasa smart plug
-            alias: Friendly name for the device
-            username: Optional username for devices that require authentication
-            password: Optional password for devices that require authentication
-        """
         if not KASA_AVAILABLE:
             raise ImportError("python-kasa library not installed. Run 'pip install python-kasa' to use Kasa devices.")
             
         self.device_ip = device_ip
         self.alias = alias
         
-        if username and password:
-            self.plug = SmartPlug(device_ip, username=username, password=password)
-        else:
-            self.plug = SmartPlug(device_ip)
+        try:
+            self.plug = IotPlug(device_ip)
+        except Exception as e:
+            logger.error(f"Failed to initialize Device with error: {e}")
+            raise
             
         self.history = []
         self.max_history_size = 100
@@ -52,8 +63,8 @@ class KasaDevice:
         self._load_history_from_daemon()
     
     def _load_history_from_daemon(self):
-        """Load historical data from daemon if available."""
-        history_file = os.path.expanduser("~/.local/share/wattwise/history.json")
+        history_file = os.path.join(config.get_data_dir(), "history.json")
+        
         if os.path.exists(history_file):
             try:
                 with open(history_file, 'r') as f:
@@ -68,7 +79,6 @@ class KasaDevice:
                 logger.warning(f"Could not load history from daemon: {e}")
 
     async def connect(self) -> Tuple[bool, Optional[str]]:
-        """Connect to the Kasa device."""
         try:
             await asyncio.wait_for(self.plug.update(), timeout=10.0)
             return True, None
@@ -84,74 +94,62 @@ class KasaDevice:
             logger.error(f"Failed to connect to Kasa device at {self.device_ip}: {e}")
             return False, str(e)
     
-    def get_device_info_sync(self) -> Dict[str, Any]:
-        """Get device information synchronously."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    def _device_has_emeter(self) -> bool:
         try:
+            return self.plug.has_emeter
+        except Exception as e:
+            logger.error(f"Error checking if device has emeter: {e}")
+            return False
+    
+    def _get_emeter_data(self) -> Dict[str, Any]:
+        try:
+            loop = get_event_loop()
+            
+            try:
+                emeter_task = loop.create_task(self.plug.get_emeter_realtime())
+                return loop.run_until_complete(asyncio.wait_for(emeter_task, timeout=5.0))
+            except Exception as e:
+                logger.error(f"Error getting data from emeter: {e}")
+            
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting emeter data: {e}")
+            return {}
+    
+    def get_device_info_sync(self) -> Dict[str, Any]:
+        try:
+            loop = get_event_loop()
+            
+            # Update the device
             update_task = loop.create_task(self.plug.update())
             loop.run_until_complete(asyncio.wait_for(update_task, timeout=10.0))
             
-            has_emeter = self.plug.has_emeter
+            # Get device capabilities
+            has_emeter = self._device_has_emeter()
             
+            # Create base device info
             info = {
-                "model": self.plug.model,
-                "alias": self.plug.alias,
-                "device_id": self.plug.device_id,
+                "model": getattr(self.plug, "model", "Unknown"),
+                "alias": getattr(self.plug, "alias", self.alias or "Unknown"),
+                "device_id": getattr(self.plug, "device_id", "Unknown"),
                 "has_emeter": has_emeter,
-                "is_on": self.plug.is_on
+                "is_on": getattr(self.plug, "is_on", False)
             }
             
             if has_emeter:
                 try:
-                    if hasattr(self.plug, "features"):
-                        watts = None
-                        current = None
-                        voltage = None
-                        
-                        if hasattr(self.plug.features, "get"):
-                            try:
-                                if self.plug.features.get("power") is not None:
-                                    watts = self.plug.features.get("power")
-                                elif self.plug.features.get("current_power_w") is not None:
-                                    watts = self.plug.features.get("current_power_w")
-                                
-                                if self.plug.features.get("current") is not None:
-                                    current = self.plug.features.get("current")
-                                elif self.plug.features.get("current_ma") is not None:
-                                    current = self.plug.features.get("current_ma") / 1000
-                                
-                                if self.plug.features.get("voltage") is not None:
-                                    voltage = self.plug.features.get("voltage")
-                                elif self.plug.features.get("voltage_mv") is not None:
-                                    voltage = self.plug.features.get("voltage_mv") / 1000
-                            except Exception as e:
-                                logger.debug(f"Error accessing feature API: {e}")
+                    emeter = self._get_emeter_data()
                     
-                    if watts is None:
-                        try:
-                            emeter_task = loop.create_task(self.plug.get_emeter_realtime())
-                            emeter = loop.run_until_complete(asyncio.wait_for(emeter_task, timeout=5.0))
-                            
-                            if isinstance(emeter, dict):
-                                watts = emeter.get("power_mw", 0) / 1000 if "power_mw" in emeter else emeter.get("power", 0)
-                                current = emeter.get("current_ma", 0) / 1000 if "current_ma" in emeter else emeter.get("current", 0)
-                                voltage = emeter.get("voltage_mv", 0) / 1000 if "voltage_mv" in emeter else emeter.get("voltage", 0)
-                            else:
-                                logger.warning(f"Unexpected emeter data format from {self.device_ip}: {type(emeter)}")
-                                watts = 0
-                                current = 0
-                                voltage = 0
-                        except asyncio.TimeoutError:
-                            logger.error(f"Timeout getting emeter data from {self.device_ip}")
-                            watts = 0
-                            current = 0
-                            voltage = 0
-                        except Exception as e:
-                            logger.error(f"Error getting emeter data from {self.device_ip}: {e}")
-                            watts = 0
-                            current = 0
-                            voltage = 0
+                    if isinstance(emeter, dict):
+                        # Handle different units based on the device variant
+                        watts = emeter.get("power_mw", 0) / 1000 if "power_mw" in emeter else emeter.get("power", 0)
+                        current = emeter.get("current_ma", 0) / 1000 if "current_ma" in emeter else emeter.get("current", 0)
+                        voltage = emeter.get("voltage_mv", 0) / 1000 if "voltage_mv" in emeter else emeter.get("voltage", 0)
+                    else:
+                        logger.warning(f"Unexpected emeter data format from {self.device_ip}: {type(emeter)}")
+                        watts = 0
+                        current = 0
+                        voltage = 0
                     
                     info.update({
                         "current_consumption": watts,
@@ -167,11 +165,20 @@ class KasaDevice:
                     })
                 
             return info
-        finally:
-            loop.close()
+        except Exception as e:
+            logger.error(f"Error getting device info: {e}")
+            return {
+                "model": "Unknown",
+                "alias": self.alias or "Unknown",
+                "device_id": "Unknown",
+                "has_emeter": False,
+                "is_on": False,
+                "current_consumption": 0,
+                "voltage": 0,
+                "current": 0
+            }
     
     def get_power_usage_sync(self) -> Optional[float]:
-        """Get current power usage synchronously."""
         try:
             info = self.get_device_info_sync()
             
@@ -195,14 +202,6 @@ class KasaDevice:
             return None
     
     def get_power_trend(self, minutes: int = 5) -> Optional[Dict[str, Any]]:
-        """Get power usage trend data for the past X minutes.
-        
-        Args:
-            minutes: Number of minutes to analyze
-            
-        Returns:
-            Dictionary with trend data or None if insufficient data
-        """
         if not self.history:
             return None
             
@@ -225,150 +224,151 @@ class KasaDevice:
             "period_minutes": minutes
         }
 
-def discover_devices_sync(timeout: int = 5, username: Optional[str] = None, password: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Discover Kasa devices on the network.
+async def discover_devices(timeout: int = 5) -> Dict[str, Any]:
+    if not KASA_AVAILABLE:
+        raise ImportError("python-kasa library not installed. Run 'pip install python-kasa' to use Kasa devices.")
     
-    Args:
-        timeout: Discovery timeout in seconds
-        username: Optional username for devices that require authentication
-        password: Optional password for devices that require authentication
+    try:
+        console.print(f"Discovering Kasa devices on your network for {timeout} seconds...")
+        devices = await Discover.discover(timeout=timeout)
+        return devices
+    except Exception as e:
+        logger.error(f"Error discovering devices: {e}")
+        return {}
+
+def display_discovered_devices(devices: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not devices:
+        console.print("[yellow]No Kasa devices found on your network.[/yellow]")
+        console.print("Make sure your devices are powered on and connected to the same network.")
+        return []
+    
+    table = Table(title="Discovered Kasa Devices")
+    table.add_column("#", style="cyan", no_wrap=True)
+    table.add_column("Name", style="green")
+    table.add_column("IP Address", style="blue")
+    table.add_column("Model", style="magenta")
+    table.add_column("Power", style="yellow")
+    table.add_column("State", style="red")
+    
+    device_list = []
+    index = 1
+    
+    loop = get_event_loop()
+    
+    for ip, device in devices.items():
+        name = getattr(device, "alias", "Unknown")
+        model = getattr(device, "model", "Unknown")
+        state = getattr(device, "is_on", False)
+        state_display = "[green]ON[/green]" if state else "[red]OFF[/red]"
+        power = "N/A"
         
-    Returns:
-        List of dictionaries with device information
-    """
+        has_emeter = False
+        if hasattr(device, 'has_emeter'):
+            has_emeter = device.has_emeter
+        
+        if has_emeter:
+            try:
+                if hasattr(device, 'get_emeter_realtime'):
+                    emeter_task = loop.create_task(device.get_emeter_realtime())
+                    emeter = loop.run_until_complete(asyncio.wait_for(emeter_task, timeout=5.0))
+                    if isinstance(emeter, dict):
+                        watts = emeter.get("power_mw", 0) / 1000 if "power_mw" in emeter else emeter.get("power", 0)
+                        power = f"{watts:.1f} W"
+            except Exception as e:
+                logger.debug(f"Error getting power consumption for {name}: {e}")
+                power = "Error"
+        
+        table.add_row(
+            str(index),
+            name,
+            ip,
+            model,
+            power,
+            state_display
+        )
+        
+        device_list.append({
+            "index": index,
+            "name": name,
+            "ip": ip,
+            "model": model,
+            "has_emeter": has_emeter,
+            "state": state
+        })
+        
+        index += 1
+    
+    console.print(table)
+    console.print(f"Found {len(device_list)} Kasa devices on your network.\n")
+    
+    return device_list
+
+def discover_devices_sync(timeout: int = 5, display: bool = True) -> List[Dict[str, Any]]:
     if not KASA_AVAILABLE:
         logger.warning("python-kasa library not installed. Run 'pip install python-kasa' to use Kasa devices.")
         return []
-        
-    from kasa import Discover
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        try:
-            discover_kwargs = {"timeout": timeout}
-            
-            if username and password:
-                discover_kwargs["username"] = username
-                discover_kwargs["password"] = password
-                
-            discover_task = Discover.discover(**discover_kwargs)
-            devices = loop.run_until_complete(asyncio.wait_for(discover_task, timeout=timeout+5.0))
-            
-            if not devices:
-                logger.warning("No devices found during discovery")
-                return []
-                
-        except asyncio.TimeoutError:
-            logger.error(f"Discovery timed out after {timeout+5} seconds")
-            return []
-        except TypeError as e:
-            logger.debug(f"Falling back to legacy discovery: {e}")
-            try:
-                discover_task = Discover.discover(timeout=timeout)
-                devices = loop.run_until_complete(asyncio.wait_for(discover_task, timeout=timeout+5.0))
-                
-                if not devices:
-                    logger.warning("No devices found during legacy discovery")
-                    return []
-            except asyncio.TimeoutError:
-                logger.error(f"Legacy discovery timed out after {timeout+5} seconds")
-                return []
-            except Exception as e:
-                logger.error(f"Legacy discovery failed: {e}")
-                return []
+        loop = get_event_loop()
         
-        result = []
-        for addr, dev in devices.items():
-            device_data = {
-                "ip_address": addr,
-                "model": getattr(dev, "model", "Unknown"),
-                "alias": getattr(dev, "alias", "Unknown"),
-                "device_type": str(getattr(dev, "device_type", "Unknown")),
-                "has_emeter": False
-            }
+        devices = loop.run_until_complete(discover_devices(timeout))
+        
+        if display:
+            return display_discovered_devices(devices)
+        
+        device_list = []
+        index = 1
+        
+        for ip, device in devices.items():
+            name = getattr(device, "alias", "Unknown")
+            model = getattr(device, "model", "Unknown")
+            state = getattr(device, "is_on", False)
             
-            if hasattr(dev, "has_emeter"):
-                device_data["has_emeter"] = dev.has_emeter
-            elif hasattr(dev, "features") and "power" in getattr(dev.features, "keys", lambda: [])():
-                device_data["has_emeter"] = True
-                
-            result.append(device_data)
+            has_emeter = False
+            if hasattr(device, 'has_emeter'):
+                has_emeter = device.has_emeter
             
-        return result
+            device_list.append({
+                "index": index,
+                "name": name,
+                "ip": ip,
+                "model": model,
+                "has_emeter": has_emeter,
+                "state": state
+            })
+            
+            index += 1
+        
+        return device_list
     except Exception as e:
-        logger.error(f"Device discovery failed: {e}")
+        logger.error(f"Discovery error: {e}")
         return []
-    finally:
-        loop.close()
 
-async def get_device_power_history(device: SmartDevice) -> Tuple[List[float], List[float], List[datetime]]:
-    """Get the power usage history from the device.
+async def get_device_power_history(device: Device) -> Tuple[List[float], List[float], List[datetime]]:
+    if not hasattr(device, 'has_emeter') or not device.has_emeter:
+        return [], [], []
     
-    Args:
-        device: The Kasa smart device.
+    daily_stats = await device.get_emeter_daily()
+    
+    sorted_stats = sorted(daily_stats, key=lambda x: x["day"])
+    
+    energy_kwh = []
+    costs = []
+    timestamps = []
+    
+    for entry in sorted_stats:
+        day = entry["day"]
+        month = entry["month"]
+        year = entry["year"]
         
-    Returns:
-        A tuple containing three lists:
-        - List of power readings in watts
-        - List of current readings in amps (if available, otherwise empty)
-        - List of timestamps for the readings
+        date = datetime(year, month, day)
         
-    Raises:
-        KasaError: If there's an issue getting the device's power history.
-    """
-    try:
-        await device.update()
+        energy = entry.get("energy_wh", 0) / 1000.0 if "energy_wh" in entry else entry.get("energy", 0)
         
-        emeter = device.emeter_realtime
-        current_power = float(emeter["power"])
+        cost = entry.get("cost", 0)
         
-        current_amps = None
-        if "current" in emeter:
-            current_amps = float(emeter["current"])
-        
-        history = []
-        history_current = []
-        history_time = []
-        
-        try:
-            current_month = datetime.now().month
-            daystat = await device.get_emeter_daily(year=datetime.now().year, month=current_month)
-            
-            today = datetime.now().day
-            day_data = daystat.get(today, [])
-            
-            if day_data:
-                if isinstance(day_data, list):
-                    for i, energy_wh in enumerate(day_data):
-                        if energy_wh > 0:
-                            power = energy_wh * 60
-                            ts = datetime.now().replace(hour=i, minute=0, second=0, microsecond=0)
-                            history.append(power)
-                            if current_amps is not None:
-                                estimated_current = power / 120
-                                history_current.append(estimated_current)
-                            history_time.append(ts)
-                else:
-                    energy_wh = day_data
-                    if energy_wh > 0:
-                        power = energy_wh / 24
-                        ts = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
-                        history.append(power)
-                        if current_amps is not None:
-                            estimated_current = power / 120
-                            history_current.append(estimated_current)
-                        history_time.append(ts)
-        except Exception as e:
-            print(f"Warning: Failed to get device history stats: {e}", file=sys.stderr)
-            pass
-        
-        history.append(current_power)
-        if current_amps is not None:
-            history_current.append(current_amps)
-        history_time.append(datetime.now())
-        
-        return history, history_current, history_time
-    except Exception as e:
-        print(f"Error getting device power history: {e}", file=sys.stderr)
-        raise KasaError(f"Failed to get device power history: {e}")
+        energy_kwh.append(energy)
+        costs.append(cost)
+        timestamps.append(date)
+    
+    return energy_kwh, costs, timestamps

@@ -2,48 +2,62 @@ import os
 import sys
 import yaml
 import stat
+import logging
+import base64
 from typing import Dict, Any, Optional
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 class ConfigError(Exception):
-    """Exception raised for configuration errors."""
+    """Exception for configuration errors."""
     pass
 
-CONFIG_DIR = os.path.expanduser("~/.config/wattwise")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.yaml")
-TOKEN_FILE = os.path.join(CONFIG_DIR, "token.secret")
+def get_config_dir() -> str:
+    """Get the configuration directory path."""
+    home_dir = str(Path.home())
+    config_dir = os.path.join(home_dir, ".config", "wattwise")
+    
+    # Ensure directory exists with correct permissions
+    os.makedirs(config_dir, exist_ok=True)
+    
+    if not os.access(config_dir, os.W_OK):
+        try:
+            os.chmod(config_dir, 0o755)  # rwx r-x r-x
+        except Exception as e:
+            logger.warning(f"Could not set permissions on config directory: {e}")
+    
+    return config_dir
 
-DEFAULT_CONFIG = {
-    "homeassistant": {
-        "host": "http://10.0.0.43",
-        "token": "",
-        "device_name": "epyc_workstation",
-        "entity_id": "sensor.epyc_workstation_current_consumption",
-        "current_entity_id": "sensor.epyc_workstation_current"
-    },
-    "kasa": {
-        "device_ip": "",
-        "alias": "PC"
-    },
-    "display": {
-        "thresholds": {
-            "warning": 300,
-            "critical": 1200
-        },
-        "colors": {
-            "normal": "green",
-            "warning": "yellow",
-            "critical": "red"
-        }
-    }
-}
+def get_config_path() -> str:
+    """Get the configuration file path."""
+    return os.path.join(get_config_dir(), "config.yaml")
+
+def get_token_path() -> str:
+    """Get the token file path."""
+    return os.path.join(get_config_dir(), "token.secret")
+
+def get_data_dir() -> str:
+    """Get the data directory path."""
+    home_dir = str(Path.home())
+    data_dir = os.path.join(home_dir, ".local", "share", "wattwise")
+    
+    os.makedirs(data_dir, exist_ok=True)
+    
+    if not os.access(data_dir, os.W_OK):
+        try:
+            os.chmod(data_dir, 0o755)  # rwx r-x r-x
+        except Exception as e:
+            logger.warning(f"Could not set permissions on data directory: {e}")
+    
+    return data_dir
 
 def ensure_config_dir() -> None:
     """Ensure that the config directory exists."""
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(get_config_dir(), exist_ok=True)
     except OSError as e:
-        print(f"Error creating config directory {CONFIG_DIR}: {e}", file=sys.stderr)
+        print(f"Error creating config directory {get_config_dir()}: {e}", file=sys.stderr)
         raise ConfigError(f"Could not create config directory: {e}")
 
 def save_token(token: str) -> None:
@@ -62,11 +76,11 @@ def save_token(token: str) -> None:
         ensure_config_dir()
         
 
-        with open(TOKEN_FILE, 'w') as f:
+        with open(get_token_path(), 'w') as f:
             f.write(token)
             
 
-        os.chmod(TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
+        os.chmod(get_token_path(), stat.S_IRUSR | stat.S_IWUSR)
     except OSError as e:
         print(f"Error saving token: {e}", file=sys.stderr)
         raise ConfigError(f"Could not save token: {e}")
@@ -77,69 +91,85 @@ def load_token() -> str:
     Returns:
         The token or an empty string if not found
     """
-    if not os.path.exists(TOKEN_FILE):
+    if not os.path.exists(get_token_path()):
         return ""
         
     try:
-        with open(TOKEN_FILE, 'r') as f:
+        with open(get_token_path(), 'r') as f:
             return f.read().strip()
     except OSError as e:
         print(f"Error loading token: {e}", file=sys.stderr)
         return ""
 
 def load_config() -> Dict[str, Any]:
-    """Load configuration from file.
+    """Load configuration from file."""
+    config_path = get_config_path()
     
-    Returns:
-        Dict containing configuration values.
-        
-    Raises:
-        ConfigError: If the configuration can't be loaded.
-    """
-    if not os.path.exists(CONFIG_FILE):
-
+    # Default configuration
+    default_config = {
+        "homeassistant": {
+            "host": "",
+            "token": "",
+            "entity_id": "",
+            "current_entity_id": ""
+        },
+        "kasa": {
+            "device_ip": "",
+            "alias": "PC"
+        }
+    }
+    
+    # If config file doesn't exist, create it with defaults
+    if not os.path.exists(config_path):
         try:
-            ensure_config_dir()
-            with open(CONFIG_FILE, "w") as f:
-                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
-            return DEFAULT_CONFIG
-        except (OSError, yaml.YAMLError) as e:
-            print(f"Error creating default config: {e}", file=sys.stderr)
-            raise ConfigError(f"Could not create default configuration: {e}")
+            with open(config_path, "w") as f:
+                yaml.dump(default_config, f)
+            # Set file permissions (rw- r-- r--)
+            os.chmod(config_path, 0o644)
+        except Exception as e:
+            logger.error(f"Failed to create default config file: {e}")
+            raise ConfigError(f"Could not create configuration file: {e}")
     
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(config_path, "r") as f:
             config = yaml.safe_load(f)
         
-
+        # If config is None (empty file), use default
         if config is None:
-            print("Warning: Empty configuration file, using defaults", file=sys.stderr)
-            config = {}
+            config = default_config
         
-        if not isinstance(config, dict):
-            raise ConfigError(f"Invalid configuration format: expected dict, got {type(config)}")
-            
-
-        merged_config = DEFAULT_CONFIG.copy()
-        update_nested_dict(merged_config, config)
+        # Ensure all required sections exist
+        if "homeassistant" not in config:
+            config["homeassistant"] = default_config["homeassistant"]
+        if "kasa" not in config:
+            config["kasa"] = default_config["kasa"]
         
-
-        for section in ["homeassistant", "kasa", "display"]:
-            if section not in merged_config:
-                raise ConfigError(f"Missing required configuration section: {section}")
+        # Load token if exists
+        token_path = get_token_path()
+        if os.path.exists(token_path):
+            try:
+                with open(token_path, "r") as f:
+                    encoded_token = f.read().strip()
+                    try:
+                        config["homeassistant"]["token"] = base64.b64decode(encoded_token).decode("utf-8")
+                    except Exception as e:
+                        logger.warning(f"Failed to decode token: {e}")
+                        # If token is corrupted, remove the token file and set an empty token
+                        try:
+                            os.remove(token_path)
+                            logger.info(f"Removed corrupted token file: {token_path}")
+                        except Exception as remove_error:
+                            logger.warning(f"Could not remove corrupted token file: {remove_error}")
+                        config["homeassistant"]["token"] = ""
+            except Exception as e:
+                logger.warning(f"Error loading token: {e}")
+                config["homeassistant"]["token"] = ""
         
-
-        token = load_token()
-        if token:
-            merged_config["homeassistant"]["token"] = token
-            
-        return merged_config
-    except (OSError, yaml.YAMLError) as e:
-        print(f"Error loading config: {e}", file=sys.stderr)
-        raise ConfigError(f"Could not load configuration: {e}")
+        return config
+    
     except Exception as e:
-        print(f"Unexpected error loading configuration: {e}", file=sys.stderr)
-        raise ConfigError(f"Unexpected error loading configuration: {e}")
+        logger.error(f"Configuration error: {e}")
+        raise ConfigError(f"Could not load configuration: {e}")
 
 def update_nested_dict(d: Dict, u: Dict) -> Dict:
     """Update a nested dictionary with values from another dictionary."""
@@ -151,30 +181,37 @@ def update_nested_dict(d: Dict, u: Dict) -> Dict:
     return d
 
 def save_config(config: Dict[str, Any]) -> None:
-    """Save configuration to file.
+    """Save configuration to file."""
+    config_dir = get_config_dir()
+    config_path = get_config_path()
+    token_path = get_token_path()
     
-    Args:
-        config: Configuration dictionary to save.
-        
-    Raises:
-        ConfigError: If the configuration can't be saved.
-    """
     try:
-        ensure_config_dir()
+        token = config["homeassistant"].get("token", "")
+        config_copy = config.copy()
         
-        token = config["homeassistant"]["token"]
-        save_token(token)
+        config_copy["homeassistant"] = config_copy["homeassistant"].copy()
+        config_copy["homeassistant"]["token"] = ""
         
-        config_to_save = config.copy()
-        config_to_save["homeassistant"] = config["homeassistant"].copy()
-        config_to_save["homeassistant"]["token"] = ""
+        os.makedirs(config_dir, exist_ok=True)
         
-        with open(CONFIG_FILE, "w") as f:
-            yaml.dump(config_to_save, f, default_flow_style=False)
-    except (OSError, yaml.YAMLError) as e:
-        print(f"Error saving config: {e}", file=sys.stderr)
+        with open(config_path, "w") as f:
+            yaml.dump(config_copy, f)
+        
+        # Set file permissions (rw- r-- r--)
+        os.chmod(config_path, 0o644)
+        
+        if token:
+            try:
+                encoded_token = base64.b64encode(token.encode("utf-8")).decode("utf-8")
+                with open(token_path, "w") as f:
+                    f.write(encoded_token)
+                # Set restrictive permissions (rw- --- ---)
+                os.chmod(token_path, 0o600)
+            except Exception as e:
+                logger.error(f"Failed to save token: {e}")
+                raise ConfigError(f"Could not save authentication token: {e}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
         raise ConfigError(f"Could not save configuration: {e}")
-
-def get_config_path() -> str:
-    """Return the path to the config file."""
-    return CONFIG_FILE
