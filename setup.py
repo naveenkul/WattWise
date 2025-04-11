@@ -1,8 +1,13 @@
 from setuptools import setup, find_packages
+import re
+
+# Read version from the __init__ file
+with open("wattwise/__init__.py", encoding="utf-8") as f:
+    version = re.search(r'__version__ = "(.*?)"', f.read()).group(1)
 
 setup(
     name="wattwise",
-    version="0.1.3",
+    version=version,
     author="Naveen",
     author_email="hey@naveen.ing",
     description="A CLI tool for monitoring power usage by devices plugged into smart plugs",
@@ -14,7 +19,7 @@ setup(
     install_requires=[
         "typer>=0.7.0",
         "rich>=12.0.0",
-        "python-kasa>=0.5.0",
+        "python-kasa>=0.10.2",
         "requests>=2.28.0",
         "pyyaml>=6.0",
         "asyncio>=3.4.3",

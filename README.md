@@ -16,6 +16,9 @@ A lightweight CLI tool for monitoring power usage from smart plugs in real-time,
 - Continuous monitoring with charts and historical data
 - Simple command-line interface
 
+## Latest changes
+- v0.1.4 : Uses latest python-kasa version(0.10.2), various fixes and improvements.
+
 ## Installation
 
 ### Via pip
@@ -39,11 +42,13 @@ mkdir -p ~/.local/share/wattwise
 # Configure Home Assistant
 docker run -it --rm --network host \
   -v ~/.config/wattwise:/root/.config/wattwise \
+  -v ~/.local/share/wattwise:/root/.local/share/wattwise \
   wattwise config ha
 
 # OR Configure Kasa smart plug
 docker run -it --rm --network host \
   -v ~/.config/wattwise:/root/.config/wattwise \
+  -v ~/.local/share/wattwise:/root/.local/share/wattwise \
   wattwise config kasa
 
 # 4. Run a single check with Docker
@@ -57,6 +62,16 @@ docker run -it --rm --network host \
   -v ~/.config/wattwise:/root/.config/wattwise \
   -v ~/.local/share/wattwise:/root/.local/share/wattwise \
   wattwise --watch
+
+# 6. If you have permission issues, you can fix them with:
+sudo chown -R $USER:$USER ~/.config/wattwise ~/.local/share/wattwise
+chmod -R u+rw ~/.config/wattwise ~/.local/share/wattwise
+
+# Or using the built-in command:
+docker run -it --rm --network host \
+  -v ~/.config/wattwise:/root/.config/wattwise \
+  -v ~/.local/share/wattwise:/root/.local/share/wattwise \
+  wattwise config fix-permissions
 ```
 
 ## Uninstallation
@@ -117,6 +132,9 @@ wattwise config kasa
 # Quick power view (single reading)
 wattwise
 
+# To discover the kasa devices on your local network
+wattwise --discover
+
 # Continuous monitoring with charts
 wattwise --watch
 
@@ -166,6 +184,7 @@ alias wattwise='docker run -it --rm --network host \
 # After creating the alias, you can use it just like the normal command:
 wattwise  # Single reading
 wattwise --watch  # Continuous monitoring
+wattwise config fix-permissions  # Fix directory permissions
 ```
 
 ## License

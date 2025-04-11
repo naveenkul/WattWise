@@ -3,6 +3,7 @@ import logging
 import time
 import sys
 import os
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -12,6 +13,7 @@ from rich.prompt import Prompt, Confirm
 from . import config
 from . import homeassistant
 from . import display
+from . import get_version
 
 
 logging.basicConfig(
@@ -24,9 +26,10 @@ logging.basicConfig(
 
 logger = logging.getLogger("wattwise")
 
-
-DATA_DIR = os.path.expanduser("~/.local/share/wattwise")
+DATA_DIR = config.get_data_dir()
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 app = typer.Typer(
     name="wattwise",
@@ -42,9 +45,6 @@ config_app = typer.Typer(
 app.add_typer(config_app, name="config")
 
 console = Console()
-
-
-os.makedirs(DATA_DIR, exist_ok=True)
 
 @config_app.command("show")
 def show_config():
@@ -64,7 +64,7 @@ def show_config():
                 
         ha_stats = {
             "host": ha_config["host"],
-            "entity_id": f"Power: {ha_config['entity_id']}",
+            "entity_id": f"Power: {ha_config.get('entity_id', 'Not configured')}",
             "current_entity_id": f"Current: {ha_config.get('current_entity_id', 'Not configured')}",
             "token": token_display
         }
@@ -79,7 +79,8 @@ def show_config():
         
         display_mgr.display_stats("Configuration Info", {
             "config_file": config.get_config_path(),
-            "version": "0.1.0"
+            "data_dir": DATA_DIR,
+            "version": get_version()
         })
     except config.ConfigError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
@@ -172,24 +173,61 @@ def configure_ha():
 def configure_kasa():
     """Configure Kasa smart plug integration."""
     try:
+        from . import kasa
+        
         cfg = config.load_config()
         display_mgr = display.DisplayManager(cfg)
         
         console.print("[bold blue]WattWise - Kasa Smart Plug Configuration[/bold blue]")
         
-
-        device_ip = Prompt.ask(
-            "Kasa device IP address",
-            default=cfg["kasa"].get("device_ip", "")
-        )
+        # Discover devices automatically
+        console.print("\n[bold]Discovering Kasa devices on your network...[/bold]")
+        discovered_devices = kasa.discover_devices_sync(timeout=8)
+        
+        device_ip = ""
+        device_alias = ""
+        
+        if discovered_devices:
+            console.print("\n[bold]Select a device to configure:[/bold]")
+            selection = Prompt.ask(
+                "Enter device number, or enter IP address manually",
+                default="" if not cfg["kasa"].get("device_ip") else cfg["kasa"].get("device_ip")
+            )
+            
+            try:
+                device_index = int(selection)
+                # Find the device with this index
+                selected_device = next((d for d in discovered_devices if d["index"] == device_index), None)
+                
+                if selected_device:
+                    device_ip = selected_device["ip"]
+                    device_alias = selected_device["name"]
+                    console.print(f"[green]Selected:[/green] {device_alias} at {device_ip}")
+                else:
+                    console.print(f"[yellow]No device with index {device_index} found.[/yellow]")
+                    # Fall back to manual entry
+                    device_ip = Prompt.ask(
+                        "Kasa device IP address",
+                        default=cfg["kasa"].get("device_ip", "")
+                    )
+            except ValueError:
+                # Not a number, treat as IP address
+                device_ip = selection
+        else:
+            # No devices found, manual entry
+            device_ip = Prompt.ask(
+                "Kasa device IP address",
+                default=cfg["kasa"].get("device_ip", "")
+            )
+        
+        if device_ip and not device_alias:
+            device_alias = Prompt.ask(
+                "Kasa device alias",
+                default=cfg["kasa"].get("alias", "PC")
+            )
+        
         cfg["kasa"]["device_ip"] = device_ip
-        
-        device_alias = Prompt.ask(
-            "Kasa device alias",
-            default=cfg["kasa"].get("alias", "PC")
-        )
         cfg["kasa"]["alias"] = device_alias
-        
 
         require_auth = Confirm.ask(
             "Does this device require authentication?",
@@ -210,15 +248,12 @@ def configure_kasa():
             )
             cfg["kasa"]["password"] = password
         else:
-
             cfg["kasa"].pop("username", None)
             cfg["kasa"].pop("password", None)
-            
-
+        
         if device_ip:
             console.print("Testing connection to Kasa device...")
             try:
-                from . import kasa
                 device = kasa.KasaDevice(
                     device_ip,
                     device_alias,
@@ -226,28 +261,22 @@ def configure_kasa():
                     password=cfg["kasa"].get("password")
                 )
                 
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # Use the persistent event loop instead of creating a new one
+                loop = kasa.get_event_loop()
+                success, error = loop.run_until_complete(device.connect())
                 
-                try:
-                    success, error = loop.run_until_complete(device.connect())
-                    if success:
-                        display_mgr.show_success("Kasa Device", "Connection successful!")
-                    else:
-                        display_mgr.show_error("Kasa Device", f"Connection failed: {error}")
-                finally:
-                    loop.close()
+                if success:
+                    display_mgr.show_success("Kasa Device", "Connection successful!")
+                else:
+                    display_mgr.show_error("Kasa Device", f"Connection failed: {error}")
             except Exception as e:
                 display_mgr.show_error("Kasa Device", f"Connection test failed: {e}")
         else:
             console.print("[yellow]Note: Device IP is required to test connection.[/yellow]")
-            
-
+        
         config.save_config(cfg)
         display_mgr.show_success("Configuration", "Kasa settings saved successfully!")
         
-
         console.print("\n[bold]Next steps:[/bold]")
         console.print("- Run [bold cyan]wattwise[/bold cyan] to see your current power usage")
         console.print("- Run [bold cyan]wattwise --watch[/bold cyan] to continuously monitor power usage")
@@ -255,6 +284,94 @@ def configure_kasa():
     except Exception as e:
         logger.error(f"Configuration error: {e}")
         console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+@config_app.command("fix-permissions")
+def fix_permissions():
+    """Fix permissions on configuration and data directories."""
+    try:
+        console.print("[bold blue]WattWise - Fixing Directory Permissions[/bold blue]")
+        
+        config_dir = config.get_config_dir()
+        data_dir = config.get_data_dir()
+        
+        config_dir_exists = os.path.exists(config_dir)
+        data_dir_exists = os.path.exists(data_dir)
+        
+        config_dir_writable = os.access(config_dir, os.W_OK) if config_dir_exists else False
+        data_dir_writable = os.access(data_dir, os.W_OK) if data_dir_exists else False
+        
+        need_sudo = (config_dir_exists and not config_dir_writable) or (data_dir_exists and not data_dir_writable)
+        
+        os.makedirs(config_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
+        
+        try:
+            os.chmod(config_dir, 0o755)  # rwx r-x r-x
+            console.print(f"[green]✓[/green] Set permissions on config directory: {config_dir}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Could not set permissions on config directory: {e}")
+            need_sudo = True
+        
+        try:
+            os.chmod(data_dir, 0o755)  # rwx r-x r-x
+            console.print(f"[green]✓[/green] Set permissions on data directory: {data_dir}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Could not set permissions on data directory: {e}")
+            need_sudo = True
+        
+        config_path = config.get_config_path()
+        if os.path.exists(config_path):
+            try:
+                os.chmod(config_path, 0o644)  # rw- r-- r--
+                console.print(f"[green]✓[/green] Set permissions on config file: {config_path}")
+            except Exception as e:
+                console.print(f"[red]✗[/red] Could not set permissions on config file: {e}")
+                need_sudo = True
+        
+        token_path = config.get_token_path()
+        if os.path.exists(token_path):
+            try:
+                os.chmod(token_path, 0o600)  # rw- --- ---
+                console.print(f"[green]✓[/green] Set permissions on token file: {token_path}")
+            except Exception as e:
+                console.print(f"[red]✗[/red] Could not set permissions on token file: {e}")
+                need_sudo = True
+                # If token file is corrupted or has permission issues, try to remove it
+                try:
+                    os.remove(token_path)
+                    console.print(f"[yellow]![/yellow] Removed problematic token file: {token_path}")
+                except Exception as remove_error:
+                    console.print(f"[red]✗[/red] Could not remove problematic token file: {remove_error}")
+        
+        # Check for history.json
+        history_path = os.path.join(data_dir, "history.json")
+        if os.path.exists(history_path):
+            try:
+                os.chmod(history_path, 0o644)  # rw- r-- r--
+                console.print(f"[green]✓[/green] Set permissions on history file: {history_path}")
+            except Exception as e:
+                console.print(f"[red]✗[/red] Could not set permissions on history file: {e}")
+                need_sudo = True
+        
+        console.print("\n[bold green]Permission check complete![/bold green]")
+        
+        if need_sudo:
+            console.print("\n[bold yellow]Permissions could not be fully fixed.[/bold yellow]")
+            console.print("You need to run the following command to take ownership of the configuration files:")
+            console.print("[bold cyan]sudo chown -R $USER:$USER ~/.config/wattwise ~/.local/share/wattwise[/bold cyan]")
+        else:
+            console.print("\n[bold green]All permissions have been set correctly![/bold green]")
+            console.print("You can now run [bold cyan]wattwise config kasa[/bold cyan] to set up your device.")
+            
+        console.print("\n[dim]If you continue to have issues, you can always try:[/dim]")
+        console.print("[dim cyan]sudo chown -R $USER:$USER ~/.config/wattwise ~/.local/share/wattwise[/dim cyan]")
+        
+    except Exception as e:
+        logger.error(f"Fix permissions error: {e}")
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print("[bold yellow]Try running the following command instead:[/bold yellow]")
+        console.print("[bold cyan]sudo chown -R $USER:$USER ~/.config/wattwise ~/.local/share/wattwise[/bold cyan]")
         raise typer.Exit(code=1)
 
 @app.command(hidden=True)
@@ -298,10 +415,36 @@ def view(
         False,
         "--raw",
         help="Output only the raw watts value as a number, suitable for use in scripts"
+    ),
+    discover: bool = typer.Option(
+        False,
+        "--discover", "-d",
+        help="Discover and show available Kasa devices on your network"
     )
 ):
     """View current power usage from smart plugs."""
     try:
+        # Handle discovery mode
+        if discover:
+            from . import kasa
+            console.print("[bold blue]WattWise - Discovering Kasa Devices[/bold blue]\n")
+            kasa.discover_devices_sync(timeout=10)
+            console.print("\nTo configure a device, run: [bold cyan]wattwise config kasa[/bold cyan]")
+            return
+            
+        # Check for permission issues first
+        config_dir = config.get_config_dir()
+        if not os.access(config_dir, os.W_OK):
+            display_mgr = display.DisplayManager({})
+            display_mgr.show_error(
+                "Permission Error", 
+                "No write permission on configuration directory. Please run the following command to fix:"
+            )
+            console.print("\n[bold cyan]wattwise config fix-permissions[/bold cyan]")
+            console.print("\nIf that doesn't work, you may need to run:")
+            console.print("[bold cyan]sudo chown -R $USER:$USER ~/.config/wattwise ~/.local/share/wattwise[/bold cyan]")
+            raise typer.Exit(code=1)
+            
         cfg = config.load_config()
         display_mgr = display.DisplayManager(cfg)
         
@@ -313,19 +456,38 @@ def view(
         use_kasa = source == "kasa" or (source is None and kasa_config.get("device_ip") and not use_ha)
         
         if not use_ha and not use_kasa and not mock:
-
+            # No data sources configured - first time setup
+            from . import kasa
+            
             display_mgr.show_error(
                 "Configuration Error", 
                 "No data sources configured. You need to set up a data source first."
             )
+            
+            # Try to discover available Kasa devices
+            console.print("\n[bold]Looking for Kasa devices on your network...[/bold]")
+            
+            try:
+                discovered_devices = kasa.discover_devices_sync(timeout=5)
+                
+                if discovered_devices:
+                    console.print("\n[bold]To configure one of these devices, run:[/bold]")
+                    console.print("[bold cyan]wattwise config kasa[/bold cyan]")
+                else:
+                    console.print("\n[yellow]No Kasa devices found on your network.[/yellow]")
+                    console.print("If you have Kasa devices, make sure they are powered on and connected to your network.")
+            except Exception as e:
+                logger.warning(f"Error discovering devices: {e}")
+            
             console.print("\n[bold]Please run one of the following commands to configure WattWise:[/bold]")
-            console.print("- [bold cyan]wattwise config ha[/bold cyan] - Configure Home Assistant")
             console.print("- [bold cyan]wattwise config kasa[/bold cyan] - Configure Kasa smart plug")
+            console.print("- [bold cyan]wattwise config ha[/bold cyan] - Configure Home Assistant")
+            console.print("\nTo discover all available Kasa devices, run:")
+            console.print("[bold cyan]wattwise --discover[/bold cyan]")
+            
             raise typer.Exit(code=1)
-        
 
         if use_ha or mock:
-
             current_entity_id = ha_config.get("current_entity_id") if show_current else None
             ha_client = homeassistant.HomeAssistant(
                 ha_config["host"], 
@@ -335,7 +497,6 @@ def view(
                 mock=mock
             )
             
-
             success, error = ha_client.validate_connection()
             if not success and not mock:
                 display_mgr.show_error(
@@ -347,30 +508,35 @@ def view(
             if mock:
                 console.print("[bold yellow]Using mock data mode - no real connection to Home Assistant[/bold yellow]")
             
-
             data_source = ha_client
             source_name = "Home Assistant"
         else:
-
             from . import kasa
-            kasa_client = kasa.KasaDevice(
-                kasa_config["device_ip"],
-                kasa_config.get("alias", ""),
-                username=kasa_config.get("username"),
-                password=kasa_config.get("password")
-            )
-            
-            data_source = kasa_client
-            source_name = "Kasa Smart Plug"
+            try:
+                kasa_client = kasa.KasaDevice(
+                    kasa_config["device_ip"],
+                    kasa_config.get("alias", ""),
+                    username=kasa_config.get("username"),
+                    password=kasa_config.get("password")
+                )
+                
+                data_source = kasa_client
+                source_name = "Kasa Smart Plug"
+            except Exception as e:
+                display_mgr.show_error(
+                    "Kasa Connection Error", 
+                    f"Failed to initialize Kasa device: {e}"
+                )
+                console.print("\nYou may need to run this command to fix permission issues:")
+                console.print("[bold cyan]wattwise config fix-permissions[/bold cyan]")
+                raise typer.Exit(code=1)
         
-
+        # Load history
         if watch and os.path.exists(HISTORY_FILE) and not mock:
             try:
-                import json
                 with open(HISTORY_FILE, 'r') as f:
                     history_data = json.load(f)
                     
-
                     if hasattr(data_source, 'power_history') and not data_source.power_history:
                         data_source.power_history = history_data.get('power', [])
                     elif hasattr(data_source, 'history') and not data_source.history:
@@ -379,7 +545,7 @@ def view(
                     if show_current and hasattr(data_source, 'current_history') and not data_source.current_history:
                         data_source.current_history = history_data.get('current', [])
                         
-                    logger.info(f"Loaded {len(data_source.power_history)} power readings and " + 
+                    logger.info(f"Loaded {len(data_source.power_history) if hasattr(data_source, 'power_history') else len(data_source.history)} power readings and " + 
                               (f"{len(data_source.current_history)} current readings" if hasattr(data_source, 'current_history') else "0 current readings") + 
                               " from history")
             except Exception as e:
@@ -394,10 +560,8 @@ def view(
             if not raw:
                 console.print("\n[bold]Monitoring stopped.[/bold]")
             
-
             if watch:
                 try:
-                    import json
                     power_history = []
                     if hasattr(data_source, 'power_history'):
                         power_history = data_source.power_history
@@ -414,6 +578,11 @@ def view(
                 except Exception as e:
                     logger.warning(f"Could not save history to file: {e}")
             
+    except config.ConfigError as e:
+        console.print(f"[bold red]Configuration Error:[/bold red] {e}")
+        console.print("\nYou may need to run this command to fix permission issues:")
+        console.print("[bold cyan]wattwise config fix-permissions[/bold cyan]")
+        raise typer.Exit(code=1)
     except Exception as e:
         logger.error(f"View error: {e}")
         console.print(f"[bold red]Error:[/bold red] {e}")
@@ -566,6 +735,11 @@ def callback(
         False,
         "--raw",
         help="Output only the raw watts value as a number, suitable for use in scripts"
+    ),
+    discover: bool = typer.Option(
+        False,
+        "--discover", "-d",
+        help="Discover and show available Kasa devices on your network"
     )
 ):
     """
@@ -578,12 +752,12 @@ def callback(
       wattwise --current --watch Monitor power and current continuously
       wattwise --raw             Output only the raw watts value for scripting use
       wattwise --mock            Use mock data for testing (no real connection)
-      wattwise config ha         Configure Home Assistant
+      wattwise --discover        Find all Kasa devices on your network
       wattwise config kasa       Configure Kasa smart plug
+      wattwise config ha         Configure Home Assistant
     """
 
     if ctx.invoked_subcommand is None:
-
         ctx.invoke(
             view,
             watch=watch,
@@ -592,7 +766,8 @@ def callback(
             show_current=show_current,
             mock=mock,
             source=source,
-            raw=raw
+            raw=raw,
+            discover=discover
         )
 
 def main():

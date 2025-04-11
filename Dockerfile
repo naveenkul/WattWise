@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -7,8 +7,11 @@ COPY wattwise ./wattwise
 
 RUN pip install --no-cache-dir .
 
-RUN mkdir -p /root/.config/wattwise
-RUN mkdir -p /root/.local/share/wattwise
+# Create directories with correct permissions
+RUN mkdir -p /root/.config/wattwise && \
+    mkdir -p /root/.local/share/wattwise && \
+    chmod -R 755 /root/.config/wattwise && \
+    chmod -R 755 /root/.local/share/wattwise
 
 # Set the entrypoint to the wattwise command
 ENTRYPOINT ["wattwise"]
