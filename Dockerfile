@@ -1,11 +1,9 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
 COPY README.md LICENSE pyproject.toml setup.py ./
 COPY wattwise ./wattwise
-
-RUN pip install --no-cache-dir python-kasa>=0.10.2
 
 RUN pip install --no-cache-dir .
 
